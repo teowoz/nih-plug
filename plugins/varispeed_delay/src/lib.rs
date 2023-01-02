@@ -17,6 +17,7 @@
 use nih_plug::prelude::*;
 use std::sync::Arc;
 use std::iter::zip;
+use std::cmp::min;
 use rubato::{InterpolationParameters, InterpolationType, Resampler, SincFixedIn, SincFixedOut, WindowFunction};
 
 const LENGTH_IN_SAMPLES: usize = 480000;
@@ -93,7 +94,7 @@ impl Default for VariSpeedDelayParams {
                     max: MAX_SPEED_FACTOR,
                 },
             )
-            .with_smoother(SmoothingStyle::Logarithmic(10.0))
+            .with_smoother(SmoothingStyle::Linear(0.05))
             .with_unit(" ips"),
         }
     }
@@ -152,8 +153,10 @@ impl Plugin for VariSpeedDelay {
         println!("creating resampler_in {}, {}", self.chunk_size, channels);
         self.resampler_in = SincFixedIn::<f32>::new(initial_resample_ratio, max_relative_ratio, params1, self.chunk_size, channels).unwrap();
         //self.resampler_in_output = self.resampler_in.output_buffer_allocate(); // BUG in rubato???
+        let internal_chunk_length = self.chunk_size * MAX_SPEED_FACTOR as usize * MAX_SPEED_FACTOR as usize + self.chunk_size*2 + 2;
+        self.resampler_in_output.clear();
         for _ in 0..channels {
-            self.resampler_in_output.push(vec![0.0; self.chunk_size]);
+            self.resampler_in_output.push(vec![0.0; internal_chunk_length]);
         }
         println!("resampler_in_output has {} channels", self.resampler_in_output.len());
         if self.resampler_in_output.len()>0 {
@@ -161,9 +164,11 @@ impl Plugin for VariSpeedDelay {
         }
         self.resampler_out = SincFixedOut::<f32>::new(1.0/initial_resample_ratio, max_relative_ratio, params2, self.chunk_size, channels).unwrap();
         //self.resampler_out_output = self.resampler_out.output_buffer_allocate();
+        self.resampler_out_output.clear();
+        self.resampler_out_input.clear();
         for _ in 0..channels {
             self.resampler_out_output.push(vec![0.0; self.chunk_size]);
-            self.resampler_out_input.push(vec![0.0; self.chunk_size]);
+            self.resampler_out_input.push(vec![0.0; internal_chunk_length]);
         }
         self.delay_line.resize(channels.try_into().unwrap(), [0.0; LENGTH_IN_SAMPLES]);
 
@@ -193,26 +198,35 @@ impl Plugin for VariSpeedDelay {
                 channels.push(ch);
             }
             self.resampler_in.process_into_buffer(&channels, &mut self.resampler_in_output, None).unwrap();
+            let internal_len = self.resampler_in_output[0].len();
+            for ch in &mut self.resampler_out_input {
+                ch.resize(internal_len, 0.0);
+            }
             // TODO suboptimal, excessive copying?
-            for (delaybuff, mut res_out_in) in zip(&self.delay_line, &mut self.resampler_out_input) {
-                assert_eq!(self.chunk_size, res_out_in.len());
-                for i in 0..self.chunk_size {
+            for (delaybuff, res_out_in) in zip(&self.delay_line, &mut self.resampler_out_input) {
+                //assert_eq!(self.chunk_size, res_out_in.len());
+                for i in 0..internal_len {
                     let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
                     res_out_in[i] = delaybuff[dlpos];
                 }
             }
-            for (mut delaybuff, res_in_out) in zip(&mut self.delay_line, &self.resampler_in_output) {
-                assert_eq!(self.chunk_size, res_in_out.len());
-                for i in 0..self.chunk_size {
+            for (delaybuff, res_in_out) in zip(&mut self.delay_line, &self.resampler_in_output) {
+                //assert_eq!(self.chunk_size, res_in_out.len());
+                /*if self.chunk_size != res_in_out.len() {
+                    println!("chunk_size != res_in_out.len(), {}, {}", self.chunk_size, res_in_out.len());
+                }*/
+                for i in 0..internal_len {
                     let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
                     delaybuff[dlpos] = res_in_out[i];
                 }
             }
-            self.delay_line_pos += self.chunk_size;
+            self.delay_line_pos += internal_len;
             self.delay_line_pos %= LENGTH_IN_SAMPLES;
-            self.resampler_out.process_into_buffer(&self.resampler_out_input, &mut self.resampler_out_output, None).unwrap();
+            if let Err(e) = self.resampler_out.process_into_buffer(&self.resampler_out_input, &mut self.resampler_out_output, None) {
+                println!("resampler_out.process_into_buffer failed: {}", e);
+            }
     
-            for (mut out_samples, res_out) in zip(&mut channels, &self.resampler_out_output) {
+            for (out_samples, res_out) in zip(&mut channels, &self.resampler_out_output) {
                 assert_eq!(self.chunk_size, res_out.len());
                 for i in 0..self.chunk_size {
                     out_samples[i] = res_out[i];
