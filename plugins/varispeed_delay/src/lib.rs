@@ -29,13 +29,13 @@ struct VariSpeedDelay {
     chunk_size: usize,
 
     // state here
-    resampler_in: SincFixedIn::<f64>,
-    resampler_out: SincFixedOut::<f64>,
-    resampler_in_output: Vec<Vec<f64>>,
-    resampler_out_output: Vec<Vec<f64>>,
-    resampler_out_input: Vec<Vec<f64>>,
+    resampler_in: SincFixedIn::<f32>,
+    resampler_out: SincFixedOut::<f32>,
+    resampler_in_output: Vec<Vec<f32>>,
+    resampler_out_output: Vec<Vec<f32>>,
+    resampler_out_input: Vec<Vec<f32>>,
     
-    delay_line: Vec<[f64; LENGTH_IN_SAMPLES]>,
+    delay_line: Vec<[f32; LENGTH_IN_SAMPLES]>,
     delay_line_pos: usize,
 }
 
@@ -49,11 +49,29 @@ struct VariSpeedDelayParams {
 
 impl Default for VariSpeedDelay {
     fn default() -> Self {
+        let params1 = InterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.5,
+            interpolation: InterpolationType::Cubic,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let params2 = InterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.5,
+            interpolation: InterpolationType::Cubic,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
         Self {
             params: Arc::new(VariSpeedDelayParams::default()),
 
             sample_rate: 1.0,
             chunk_size: 64,
+
+            // FIXME initializing fake resamplers, stupid.
+            resampler_in: SincFixedIn::<f32>::new(1.0, 1.0, params1, 1, 1).unwrap(),
+            resampler_out:  SincFixedOut::<f32>::new(1.0, 1.0, params2, 1, 1).unwrap(),
 
             resampler_in_output: Vec::new(),
             resampler_out_output: Vec::new(),
@@ -92,6 +110,8 @@ impl Plugin for VariSpeedDelay {
     const DEFAULT_INPUT_CHANNELS: u32 = 2;
     const DEFAULT_OUTPUT_CHANNELS: u32 = 2;
 
+    type BackgroundTask = ();
+
     fn params(&self) -> Arc<dyn Params> {
         self.params.clone()
     }
@@ -104,13 +124,20 @@ impl Plugin for VariSpeedDelay {
         &mut self,
         bus_config: &BusConfig,
         buffer_config: &BufferConfig,
-        _context: &mut impl InitContext,
+        _context: &mut impl InitContext<Self>,
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
 
         let sinc_len = 256;
         let f_cutoff = 0.9473371669037001;
-        let params = InterpolationParameters {
+        let params1 = InterpolationParameters {
+            sinc_len,
+            f_cutoff,
+            interpolation: InterpolationType::Cubic,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        let params2 = InterpolationParameters {
             sinc_len,
             f_cutoff,
             interpolation: InterpolationType::Cubic,
@@ -119,17 +146,26 @@ impl Plugin for VariSpeedDelay {
         };
         // we don't want SR < native SR so make 1.0 the smallest possible ratio:
         // FIXME: according to rubato docs aliasing may happen
-        let initial_resample_ratio = MAX_SPEED_FACTOR;
-        let max_relative_ratio = MAX_SPEED_FACTOR;
-        let channels = buffer_config.num_output_channels;
-        self.resampler_in = SincFixedIn::<f64>::new(initial_resample_ratio, max_relative_ratio, params, self.chunk_size, channels).unwrap();
-        self.resampler_in_output = self.resampler_in.output_buffer_allocate();
-        self.resampler_out = SincFixedOut::<f64>::new(1.0/initial_resample_ratio, max_relative_ratio, params, self.chunk_size, channels).unwrap();
-        self.resampler_out_output = self.resampler_out.output_buffer_allocate();
-        for i in 0..channels {
-            self.resampler_out_input.push(vec![0; self.chunk_size]);
+        let initial_resample_ratio: f64 = MAX_SPEED_FACTOR.into();
+        let max_relative_ratio: f64 = MAX_SPEED_FACTOR.into();
+        let channels: usize = bus_config.num_output_channels.try_into().unwrap();
+        println!("creating resampler_in {}, {}", self.chunk_size, channels);
+        self.resampler_in = SincFixedIn::<f32>::new(initial_resample_ratio, max_relative_ratio, params1, self.chunk_size, channels).unwrap();
+        //self.resampler_in_output = self.resampler_in.output_buffer_allocate(); // BUG in rubato???
+        for _ in 0..channels {
+            self.resampler_in_output.push(vec![0.0; self.chunk_size]);
         }
-        self.delay_line.resize(channels, [0; LENGTH_IN_SAMPLES]);
+        println!("resampler_in_output has {} channels", self.resampler_in_output.len());
+        if self.resampler_in_output.len()>0 {
+            println!("of {} samples", self.resampler_in_output[0].len());
+        }
+        self.resampler_out = SincFixedOut::<f32>::new(1.0/initial_resample_ratio, max_relative_ratio, params2, self.chunk_size, channels).unwrap();
+        //self.resampler_out_output = self.resampler_out.output_buffer_allocate();
+        for _ in 0..channels {
+            self.resampler_out_output.push(vec![0.0; self.chunk_size]);
+            self.resampler_out_input.push(vec![0.0; self.chunk_size]);
+        }
+        self.delay_line.resize(channels.try_into().unwrap(), [0.0; LENGTH_IN_SAMPLES]);
 
         true
     }
@@ -143,25 +179,29 @@ impl Plugin for VariSpeedDelay {
         &mut self,
         buffer: &mut Buffer,
         _aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext,
+        _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         if self.params.tape_speed.smoothed.is_smoothing() {
-            let tape_speed = self.params.tape_speed.smoothed.next();
+            let tape_speed: f64 = self.params.tape_speed.smoothed.next().into();
             self.resampler_in.set_resample_ratio_relative(tape_speed).unwrap();
             self.resampler_out.set_resample_ratio_relative(1.0/tape_speed).unwrap();
         }
         assert_eq!(buffer.len() % self.chunk_size, 0);
-        for block in buffer.iter_blocks(self.chunk_size) {
-            self.resampler_in.process_into_buffer(&block, &mut self.resampler_in_output, None);
+        for (_, block) in buffer.iter_blocks(self.chunk_size) {
+            let mut channels: Vec<&mut[f32]> = Vec::new();
+            for ch in block.into_iter() {
+                channels.push(ch);
+            }
+            self.resampler_in.process_into_buffer(&channels, &mut self.resampler_in_output, None).unwrap();
             // TODO suboptimal, excessive copying?
-            for (delaybuff, mut res_out_in) in zip(&self.delay_line, &self.resampler_out_input) {
+            for (delaybuff, mut res_out_in) in zip(&self.delay_line, &mut self.resampler_out_input) {
                 assert_eq!(self.chunk_size, res_out_in.len());
                 for i in 0..self.chunk_size {
                     let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
                     res_out_in[i] = delaybuff[dlpos];
                 }
             }
-            for (mut delaybuff, res_in_out) in zip(&self.delay_line, &self.resampler_in_output) {
+            for (mut delaybuff, res_in_out) in zip(&mut self.delay_line, &self.resampler_in_output) {
                 assert_eq!(self.chunk_size, res_in_out.len());
                 for i in 0..self.chunk_size {
                     let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
@@ -170,9 +210,9 @@ impl Plugin for VariSpeedDelay {
             }
             self.delay_line_pos += self.chunk_size;
             self.delay_line_pos %= LENGTH_IN_SAMPLES;
-            self.resampler_out.process_into_buffer(&self.resampler_out_input, &mut self.resampler_out_output, None);
+            self.resampler_out.process_into_buffer(&self.resampler_out_input, &mut self.resampler_out_output, None).unwrap();
     
-            for (mut out_samples, res_out) in zip(&block, &self.resampler_out_output) {
+            for (mut out_samples, res_out) in zip(&mut channels, &self.resampler_out_output) {
                 assert_eq!(self.chunk_size, res_out.len());
                 for i in 0..self.chunk_size {
                     out_samples[i] = res_out[i];
