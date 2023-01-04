@@ -10,4 +10,4 @@ crate-type = ["cdylib"]
 
 [dependencies]
 nih_plug = { path = "../../", features = ["assert_process_allocs"] }
-rubato = "0.12.0"
+libsoxr = { path = "../../../libsoxr-rs" }

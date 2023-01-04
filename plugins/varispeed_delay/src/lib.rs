@@ -17,11 +17,12 @@
 use nih_plug::prelude::*;
 use std::sync::Arc;
 use std::iter::zip;
-use std::cmp::min;
-use rubato::{InterpolationParameters, InterpolationType, Resampler, SincFixedIn, SincFixedOut, WindowFunction};
+use libsoxr;
 
 const LENGTH_IN_SAMPLES: usize = 480000;
-const MAX_SPEED_FACTOR: f32 = 8.0;
+const MAX_SPEED_FACTOR: f32 = 640.0;
+const DEFAULT_TAPE_SPEED: f32 = 40.0;
+const SOXR_DATA_TYPE: libsoxr::Datatype = libsoxr::Datatype::Float32I;
 
 struct VariSpeedDelay {
     params: Arc<VariSpeedDelayParams>,
@@ -30,8 +31,8 @@ struct VariSpeedDelay {
     chunk_size: usize,
 
     // state here
-    resampler_in: SincFixedIn::<f32>,
-    resampler_out: SincFixedOut::<f32>,
+    resampler_in: libsoxr::Soxr,
+    resampler_out: libsoxr::Soxr,
     resampler_in_output: Vec<Vec<f32>>,
     resampler_out_output: Vec<Vec<f32>>,
     resampler_out_input: Vec<Vec<f32>>,
@@ -50,20 +51,6 @@ struct VariSpeedDelayParams {
 
 impl Default for VariSpeedDelay {
     fn default() -> Self {
-        let params1 = InterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.5,
-            interpolation: InterpolationType::Cubic,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let params2 = InterpolationParameters {
-            sinc_len: 256,
-            f_cutoff: 0.5,
-            interpolation: InterpolationType::Cubic,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
         Self {
             params: Arc::new(VariSpeedDelayParams::default()),
 
@@ -71,8 +58,8 @@ impl Default for VariSpeedDelay {
             chunk_size: 64,
 
             // FIXME initializing fake resamplers, stupid.
-            resampler_in: SincFixedIn::<f32>::new(1.0, 1.0, params1, 1, 1).unwrap(),
-            resampler_out:  SincFixedOut::<f32>::new(1.0, 1.0, params2, 1, 1).unwrap(),
+            resampler_in: libsoxr::Soxr::create(1.0, 2.0, 1, None, None, None).unwrap(),
+            resampler_out: libsoxr::Soxr::create(2.0, 1.0, 1, None, None, None).unwrap(),
 
             resampler_in_output: Vec::new(),
             resampler_out_output: Vec::new(),
@@ -88,10 +75,11 @@ impl Default for VariSpeedDelayParams {
         Self {
             tape_speed: FloatParam::new(
                 "Tape speed",
-                1.0,
-                FloatRange::Linear {
-                    min: 1.0/MAX_SPEED_FACTOR,
+                DEFAULT_TAPE_SPEED,
+                FloatRange::Skewed {
+                    min: 1.0,
                     max: MAX_SPEED_FACTOR,
+                    factor: 0.33
                 },
             )
             .with_smoother(SmoothingStyle::Linear(0.05))
@@ -108,8 +96,8 @@ impl Plugin for VariSpeedDelay {
 
     const VERSION: &'static str = "0.1.0";
 
-    const DEFAULT_INPUT_CHANNELS: u32 = 2;
-    const DEFAULT_OUTPUT_CHANNELS: u32 = 2;
+    const DEFAULT_INPUT_CHANNELS: u32 = 1;
+    const DEFAULT_OUTPUT_CHANNELS: u32 = 1; // TODO: IMPLEMENT FOR MORE
 
     type BackgroundTask = ();
 
@@ -129,30 +117,17 @@ impl Plugin for VariSpeedDelay {
     ) -> bool {
         self.sample_rate = buffer_config.sample_rate;
 
-        let sinc_len = 256;
-        let f_cutoff = 0.9473371669037001;
-        let params1 = InterpolationParameters {
-            sinc_len,
-            f_cutoff,
-            interpolation: InterpolationType::Cubic,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        let params2 = InterpolationParameters {
-            sinc_len,
-            f_cutoff,
-            interpolation: InterpolationType::Cubic,
-            oversampling_factor: 256,
-            window: WindowFunction::BlackmanHarris2,
-        };
-        // we don't want SR < native SR so make 1.0 the smallest possible ratio:
-        // FIXME: according to rubato docs aliasing may happen
-        let initial_resample_ratio: f64 = MAX_SPEED_FACTOR.into();
-        let max_relative_ratio: f64 = MAX_SPEED_FACTOR.into();
-        let channels: usize = bus_config.num_output_channels.try_into().unwrap();
+        let channels: u32 = bus_config.num_output_channels;
         println!("creating resampler_in {}, {}", self.chunk_size, channels);
-        self.resampler_in = SincFixedIn::<f32>::new(initial_resample_ratio, max_relative_ratio, params1, self.chunk_size, channels).unwrap();
-        //self.resampler_in_output = self.resampler_in.output_buffer_allocate(); // BUG in rubato???
+
+        let io_spec = libsoxr::IOSpec::new(SOXR_DATA_TYPE, SOXR_DATA_TYPE);
+        let quality = libsoxr::QualitySpec::new(&libsoxr::QualityRecipe::High, libsoxr::QualityFlags::VR);
+
+        // libsoxr in Variable Rate mode needs maximum Input/Output ratio when creating the resampler, provide it:
+        // here input SR=host SR is constant so we need minimum Output SR relative to host SR,
+        // which is... 1 because we never downsample
+        self.resampler_in = libsoxr::Soxr::create(1.0, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
+
         let internal_chunk_length = self.chunk_size * MAX_SPEED_FACTOR as usize * MAX_SPEED_FACTOR as usize + self.chunk_size*2 + 2;
         self.resampler_in_output.clear();
         for _ in 0..channels {
@@ -162,8 +137,9 @@ impl Plugin for VariSpeedDelay {
         if self.resampler_in_output.len()>0 {
             println!("of {} samples", self.resampler_in_output[0].len());
         }
-        self.resampler_out = SincFixedOut::<f32>::new(1.0/initial_resample_ratio, max_relative_ratio, params2, self.chunk_size, channels).unwrap();
-        //self.resampler_out_output = self.resampler_out.output_buffer_allocate();
+
+        // and here output SR = host SR = constant so we need maximum input SR relative to host SR,
+        self.resampler_out = libsoxr::Soxr::create(MAX_SPEED_FACTOR as f64, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
         self.resampler_out_output.clear();
         self.resampler_out_input.clear();
         for _ in 0..channels {
@@ -172,6 +148,8 @@ impl Plugin for VariSpeedDelay {
         }
         self.delay_line.resize(channels.try_into().unwrap(), [0.0; LENGTH_IN_SAMPLES]);
 
+        self.resampler_in.set_io_ratio(1.0 / (DEFAULT_TAPE_SPEED as f64), 0).unwrap();
+        self.resampler_out.set_io_ratio(DEFAULT_TAPE_SPEED as f64, 0).unwrap();
         true
     }
 
@@ -188,33 +166,30 @@ impl Plugin for VariSpeedDelay {
     ) -> ProcessStatus {
         if self.params.tape_speed.smoothed.is_smoothing() {
             let tape_speed: f64 = self.params.tape_speed.smoothed.next().into();
-            self.resampler_in.set_resample_ratio_relative(tape_speed).unwrap();
-            self.resampler_out.set_resample_ratio_relative(1.0/tape_speed).unwrap();
+            self.resampler_in.set_io_ratio(1.0 / tape_speed, (buffer.len() as f64 * tape_speed) as usize).unwrap();
+            self.resampler_out.set_io_ratio(tape_speed, buffer.len()).unwrap();
         }
         assert_eq!(buffer.len() % self.chunk_size, 0);
         for (_, block) in buffer.iter_blocks(self.chunk_size) {
-            let mut channels: Vec<&mut[f32]> = Vec::new();
+            let mut channels: Vec<&mut[f32]> = Vec::new(); // FIXME not real-time-safe
             for ch in block.into_iter() {
                 channels.push(ch);
             }
-            self.resampler_in.process_into_buffer(&channels, &mut self.resampler_in_output, None).unwrap();
-            let internal_len = self.resampler_in_output[0].len();
-            for ch in &mut self.resampler_out_input {
+            let (done_in, internal_len) = self.resampler_in.process(Some(&channels[0]), &mut self.resampler_in_output[0]).unwrap();
+            if done_in!=self.chunk_size {
+                println!("resampler_in didn't consume all samples, done {}, chunk size {}", done_in, self.chunk_size);
+            }
+            for ch in &mut self.resampler_out_input { // FIXME not real-time-safe
                 ch.resize(internal_len, 0.0);
             }
-            // TODO suboptimal, excessive copying?
+            // TODO suboptimal, excessive copying? try to use slices as Soxr inputs
             for (delaybuff, res_out_in) in zip(&self.delay_line, &mut self.resampler_out_input) {
-                //assert_eq!(self.chunk_size, res_out_in.len());
                 for i in 0..internal_len {
                     let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
                     res_out_in[i] = delaybuff[dlpos];
                 }
             }
             for (delaybuff, res_in_out) in zip(&mut self.delay_line, &self.resampler_in_output) {
-                //assert_eq!(self.chunk_size, res_in_out.len());
-                /*if self.chunk_size != res_in_out.len() {
-                    println!("chunk_size != res_in_out.len(), {}, {}", self.chunk_size, res_in_out.len());
-                }*/
                 for i in 0..internal_len {
                     let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
                     delaybuff[dlpos] = res_in_out[i];
@@ -222,12 +197,16 @@ impl Plugin for VariSpeedDelay {
             }
             self.delay_line_pos += internal_len;
             self.delay_line_pos %= LENGTH_IN_SAMPLES;
-            if let Err(e) = self.resampler_out.process_into_buffer(&self.resampler_out_input, &mut self.resampler_out_output, None) {
-                println!("resampler_out.process_into_buffer failed: {}", e);
+            let (done_internal, done_out) = self.resampler_out.process(Some(&self.resampler_out_input[0]), &mut self.resampler_out_output[0]).unwrap();
+            if done_out!=self.chunk_size {
+                println!("resampler_out didn't produce enough samples, done {}, chunk size {}", done_out, self.chunk_size);
+            }
+            if done_internal!=internal_len {
+                println!("produced and consumed different number of samples! {} != {}", internal_len, done_internal);
             }
     
             for (out_samples, res_out) in zip(&mut channels, &self.resampler_out_output) {
-                assert_eq!(self.chunk_size, res_out.len());
+                assert_eq!(self.chunk_size, res_out.len()); // XXX
                 for i in 0..self.chunk_size {
                     out_samples[i] = res_out[i];
                 }

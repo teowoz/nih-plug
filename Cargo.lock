@@ -2266,6 +2266,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "libsoxr"
+version = "0.2.8"
+dependencies = [
+ "bitflags",
+ "libc",
+ "libsoxr-sys",
+ "pkg-config",
+]
+
+[[package]]
+name = "libsoxr-sys"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fe6a6baa6a3377e533d310a243f41dd1b5250da6947094a36b08e5ee70144445"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "linked-hash-map"
 version = "0.5.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3613,18 +3632,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rubato"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd70209c27d5b08f5528bdc779ea3ffb418954e28987f9f9775c6eac41003f9c"
-dependencies = [
- "num-complex",
- "num-integer",
- "num-traits",
- "realfft",
-]
-
-[[package]]
 name = "rustc-demangle"
 version = "0.1.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4488,8 +4495,8 @@ dependencies = [
 name = "varispeed_delay"
 version = "0.1.0"
 dependencies = [
+ "libsoxr",
  "nih_plug",
- "rubato",
 ]
 
 [[package]]
