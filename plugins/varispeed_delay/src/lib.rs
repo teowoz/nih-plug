@@ -40,6 +40,18 @@ impl Default for SpeedChange {
     }
 }
 
+struct DelayLine {
+    buffer: Vec<f32>,
+    read_pos: usize,
+    write_pos: usize
+}
+
+impl DelayLine {
+    fn new(capacity: usize) -> DelayLine {
+        DelayLine { buffer: vec![0.0; capacity], read_pos: 0, write_pos: 0 }
+    }
+}
+
 struct VariSpeedDelay {
     params: Arc<VariSpeedDelayParams>,
 
@@ -51,9 +63,7 @@ struct VariSpeedDelay {
     recorded_speed: u32,
     current_timestamp: u32,
     
-    delay_line: Vec<f32>,
-    delay_line_read_pos: usize,
-    delay_line_write_pos: usize,
+    delay_line: Box<DelayLine>,
 
     changes: Vec<SpeedChange>,
     changes_read_pos: usize,
@@ -85,9 +95,7 @@ impl Default for VariSpeedDelay {
             recorded_speed: speed_to_uint(DEFAULT_TAPE_SPEED),
             current_timestamp: 0,
 
-            delay_line: Vec::new(),
-            delay_line_read_pos: 0,
-            delay_line_write_pos: 0,
+            delay_line: Box::new(DelayLine::new(0)),
             changes: Vec::new(),
             changes_read_pos: 0,
             changes_write_pos: 0
@@ -148,10 +156,44 @@ impl Plugin for VariSpeedDelay {
 
         // libsoxr in Variable Rate mode needs maximum Input/Output ratio when creating the resampler, provide it:
         self.resampler = libsoxr::Soxr::create(MAX_SPEED_FACTOR as f64, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
+
+        let input_fn = |dl: &mut Box<DelayLine>, whole_buffer: &mut [f32], req_count: usize| {
+            let buffer = &mut whole_buffer[..req_count];
+            if dl.read_pos < dl.write_pos {
+                // a trivial case of contiguous buffer
+                let read_end = dl.read_pos + req_count;
+                if read_end < dl.write_pos {
+                    buffer[..].clone_from_slice(&dl.buffer[dl.read_pos..read_end]);
+                    dl.read_pos = read_end;
+                } else {
+                    println!("delay line starved! needs {} samples, has {}", req_count, dl.write_pos-dl.read_pos);
+                }
+            } else {
+                let avail = dl.buffer.len() - dl.read_pos;
+                if avail > req_count {
+                    let read_end = dl.read_pos + req_count;
+                    buffer[..].clone_from_slice(&dl.buffer[dl.read_pos..read_end]);
+                    dl.read_pos = read_end;
+                } else {
+                    buffer[..avail].clone_from_slice(&dl.buffer[dl.read_pos..]);
+                    let remaining = req_count - avail;
+                    if remaining < dl.write_pos {
+                        buffer[avail..].clone_from_slice(&dl.buffer[..remaining]);
+                        dl.read_pos = remaining;
+                    } else {
+                        println!("delay line fragmented and starved! needs {} samples, has {}", remaining, dl.write_pos);
+                        dl.read_pos = 0;
+                    }
+                }
+            }
+            return Ok(req_count);
+        };
+        self.resampler.set_input(input_fn, Some(&mut self.delay_line), MAX_BLOCK_SIZE * MAX_SPEED_FACTOR as usize).unwrap();
+
         // process(...) needs to process samples in place so we need some space which should never exceed block size:
-        self.delay_line.resize((self.sample_rate * LENGTH_IN_SECONDS) as usize + MAX_BLOCK_SIZE*4, 0.0);
-        self.delay_line_write_pos = (self.sample_rate * LENGTH_IN_SECONDS) as usize;
-        self.changes.resize(self.delay_line.len() / MIN_BLOCK_SIZE, SpeedChange::default());
+        self.delay_line = Box::new(DelayLine::new((self.sample_rate * LENGTH_IN_SECONDS) as usize + MAX_BLOCK_SIZE*2));
+        self.delay_line.write_pos = (self.sample_rate * LENGTH_IN_SECONDS / DEFAULT_TAPE_SPEED) as usize;
+        self.changes.resize(self.delay_line.buffer.len() / MIN_BLOCK_SIZE, SpeedChange::default());
         self.resampler.set_io_ratio(1.0, 0).unwrap();
         true
     }
@@ -201,7 +243,7 @@ impl Plugin for VariSpeedDelay {
             let ratio = (self.current_speed as f64) / (self.recorded_speed as f64);
             self.resampler.set_io_ratio(ratio, buffer.len()).unwrap();
 
-            println!("new ratio: {}; buffered in delay line = {}s pos: write {} read {}, deduced from speed = {}s", ratio, ((self.delay_line_write_pos-self.delay_line_read_pos+self.delay_line.len())%self.delay_line.len()) as f32/self.sample_rate, self.delay_line_write_pos, self.delay_line_read_pos, LENGTH_IN_SECONDS/tape_speed);
+            println!("new ratio: {}; buffered in delay line = {}s pos: write {} read {}, deduced from speed = {}s", ratio, ((self.delay_line.write_pos-self.delay_line.read_pos+self.delay_line.buffer.len())%self.delay_line.buffer.len()) as f32/self.sample_rate, self.delay_line.write_pos, self.delay_line.read_pos, LENGTH_IN_SECONDS/tape_speed);
         }
 
         let iosamples: &mut [f32] = buffer.as_slice()[0];
@@ -214,55 +256,23 @@ impl Plugin for VariSpeedDelay {
 
         //if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ before writing"); }
 
-        let end_index = self.delay_line_write_pos + iosamples.len();
-        if end_index <= self.delay_line.len() {
-            self.delay_line[self.delay_line_write_pos..end_index].clone_from_slice(&iosamples);
-            self.delay_line_write_pos = end_index % self.delay_line.len();
+        let end_index = self.delay_line.write_pos + iosamples.len();
+        if end_index <= self.delay_line.buffer.len() {
+            self.delay_line.buffer[self.delay_line.write_pos..end_index].clone_from_slice(&iosamples);
+            self.delay_line.write_pos = end_index % self.delay_line.buffer.len();
         } else {
-            let boundary = self.delay_line.len() - self.delay_line_write_pos;
-            self.delay_line[self.delay_line_write_pos..].clone_from_slice(&iosamples[..boundary]);
-            self.delay_line_write_pos = end_index - self.delay_line.len();
-            self.delay_line[..self.delay_line_write_pos].clone_from_slice(&iosamples[boundary..]);
+            let boundary = self.delay_line.buffer.len() - self.delay_line.write_pos;
+            self.delay_line.buffer[self.delay_line.write_pos..].clone_from_slice(&iosamples[..boundary]);
+            self.delay_line.write_pos = end_index - self.delay_line.buffer.len();
+            self.delay_line.buffer[..self.delay_line.write_pos].clone_from_slice(&iosamples[boundary..]);
         }
 
         //if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after writing"); }
 
-        if self.delay_line_read_pos <= self.delay_line_write_pos {
-            // contiguous buffer
-            let in0 = &self.delay_line[self.delay_line_read_pos..self.delay_line_write_pos];
-            let (done_in, done_out) = self.resampler.process(Some(in0), iosamples).unwrap();
-            if done_out != iosamples.len() {
-                println!("resampler didn't produce enough samples, done {}, block size {}", done_out, iosamples.len());
-            }
-            self.delay_line_read_pos += done_in;
-            //self.delay_line_read_pos %= self.delay_line.len();
-            if !(self.delay_line_read_pos < self.delay_line.len()) {
-                println!("read pos {}, delay len {}, write pos {}", self.delay_line_read_pos, self.delay_line.len(), self.delay_line_write_pos);
-            }
-            assert!(self.delay_line_read_pos < self.delay_line.len());
-            if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after reading 1, in {}/{}, out {}/{}", done_in, in0.len(), done_out, iosamples.len()); } else {
-                println!("in {}/{}, out {}/{}", done_in, in0.len(), done_out, iosamples.len());
-            }
-        } else {
-            let in1 = &self.delay_line[self.delay_line_read_pos..];
-            let (done_in1, done_out1) = self.resampler.process(Some(in1), iosamples).unwrap();
-            if done_out1 != iosamples.len() {
-                // need more data from delay line
-                let in2 = &self.delay_line[..self.delay_line_write_pos];
-                let (done_in2, done_out2) = self.resampler.process(Some(in2), &mut iosamples[done_out1..]).unwrap();
-                if done_out1 + done_out2 != iosamples.len() {
-                    println!("resampler didn't produce enough samples, done {}+{}, block size {}", done_out1, done_out2, iosamples.len());
-                }
-                self.delay_line_read_pos = done_in2;
-                if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after reading 2"); }
-            } else {
-                self.delay_line_read_pos += done_in1;
-                self.delay_line_read_pos %= self.delay_line.len();
-                if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after reading 3"); }
-            }
+        let done_out: usize = self.resampler.output(iosamples, iosamples.len());
+        if done_out != iosamples.len() {
+            println!("resampler didn't produce enough samples, done {}, block size {}", done_out, iosamples.len());
         }
-
-        
 
         ProcessStatus::Normal
     }
