@@ -16,29 +16,48 @@
 
 use nih_plug::prelude::*;
 use std::sync::Arc;
-use std::iter::zip;
 use libsoxr;
 
-const LENGTH_IN_SAMPLES: usize = 480000;
+const LENGTH_IN_SECONDS: f32 = 10.0;
 const MAX_SPEED_FACTOR: f32 = 640.0;
 const DEFAULT_TAPE_SPEED: f32 = 40.0;
+const MIN_BLOCK_SIZE: usize = 16;
+const MAX_BLOCK_SIZE: usize = 16384;
 const SOXR_DATA_TYPE: libsoxr::Datatype = libsoxr::Datatype::Float32I;
+
+#[derive(Clone)]
+struct SpeedChange {
+    timestamp: u32,
+    speed: u32
+}
+
+impl Default for SpeedChange {
+    fn default() -> Self {
+        Self {
+            timestamp: 0,
+            speed: 0
+        }
+    }
+}
 
 struct VariSpeedDelay {
     params: Arc<VariSpeedDelayParams>,
 
     sample_rate: f32,
-    chunk_size: usize,
 
     // state here
-    resampler_in: libsoxr::Soxr,
-    resampler_out: libsoxr::Soxr,
-    resampler_in_output: Vec<Vec<f32>>,
-    resampler_out_output: Vec<Vec<f32>>,
-    resampler_out_input: Vec<Vec<f32>>,
+    resampler: libsoxr::Soxr,
+    current_speed: u32,
+    recorded_speed: u32,
+    current_timestamp: u32,
     
-    delay_line: Vec<[f32; LENGTH_IN_SAMPLES]>,
-    delay_line_pos: usize,
+    delay_line: Vec<f32>,
+    delay_line_read_pos: usize,
+    delay_line_write_pos: usize,
+
+    changes: Vec<SpeedChange>,
+    changes_read_pos: usize,
+    changes_write_pos: usize
 }
 
 #[derive(Params)]
@@ -49,23 +68,29 @@ struct VariSpeedDelayParams {
 
 }
 
+fn speed_to_uint(speed: f32) -> u32 {
+    (speed * 256.0 + 0.5) as u32
+}
+
 impl Default for VariSpeedDelay {
     fn default() -> Self {
         Self {
             params: Arc::new(VariSpeedDelayParams::default()),
 
             sample_rate: 1.0,
-            chunk_size: 64,
 
             // FIXME initializing fake resamplers, stupid.
-            resampler_in: libsoxr::Soxr::create(1.0, 2.0, 1, None, None, None).unwrap(),
-            resampler_out: libsoxr::Soxr::create(2.0, 1.0, 1, None, None, None).unwrap(),
+            resampler: libsoxr::Soxr::create(1.0, 2.0, 1, None, None, None).unwrap(),
+            current_speed: speed_to_uint(DEFAULT_TAPE_SPEED),
+            recorded_speed: speed_to_uint(DEFAULT_TAPE_SPEED),
+            current_timestamp: 0,
 
-            resampler_in_output: Vec::new(),
-            resampler_out_output: Vec::new(),
-            resampler_out_input: Vec::new(),
             delay_line: Vec::new(),
-            delay_line_pos: 0,
+            delay_line_read_pos: 0,
+            delay_line_write_pos: 0,
+            changes: Vec::new(),
+            changes_read_pos: 0,
+            changes_write_pos: 0
         }
     }
 }
@@ -97,7 +122,7 @@ impl Plugin for VariSpeedDelay {
     const VERSION: &'static str = "0.1.0";
 
     const DEFAULT_INPUT_CHANNELS: u32 = 1;
-    const DEFAULT_OUTPUT_CHANNELS: u32 = 1; // TODO: IMPLEMENT FOR MORE
+    const DEFAULT_OUTPUT_CHANNELS: u32 = 1;
 
     type BackgroundTask = ();
 
@@ -106,7 +131,7 @@ impl Plugin for VariSpeedDelay {
     }
 
     fn accepts_bus_config(&self, config: &BusConfig) -> bool {
-        config.num_input_channels == config.num_output_channels && config.num_input_channels > 0
+        config.num_input_channels == 1 && config.num_output_channels == 1
     }
 
     fn initialize(
@@ -118,38 +143,16 @@ impl Plugin for VariSpeedDelay {
         self.sample_rate = buffer_config.sample_rate;
 
         let channels: u32 = bus_config.num_output_channels;
-        println!("creating resampler_in {}, {}", self.chunk_size, channels);
-
         let io_spec = libsoxr::IOSpec::new(SOXR_DATA_TYPE, SOXR_DATA_TYPE);
         let quality = libsoxr::QualitySpec::new(&libsoxr::QualityRecipe::High, libsoxr::QualityFlags::VR);
 
         // libsoxr in Variable Rate mode needs maximum Input/Output ratio when creating the resampler, provide it:
-        // here input SR=host SR is constant so we need minimum Output SR relative to host SR,
-        // which is... 1 because we never downsample
-        self.resampler_in = libsoxr::Soxr::create(1.0, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
-
-        let internal_chunk_length = self.chunk_size * MAX_SPEED_FACTOR as usize * MAX_SPEED_FACTOR as usize + self.chunk_size*2 + 2;
-        self.resampler_in_output.clear();
-        for _ in 0..channels {
-            self.resampler_in_output.push(vec![0.0; internal_chunk_length]);
-        }
-        println!("resampler_in_output has {} channels", self.resampler_in_output.len());
-        if self.resampler_in_output.len()>0 {
-            println!("of {} samples", self.resampler_in_output[0].len());
-        }
-
-        // and here output SR = host SR = constant so we need maximum input SR relative to host SR,
-        self.resampler_out = libsoxr::Soxr::create(MAX_SPEED_FACTOR as f64, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
-        self.resampler_out_output.clear();
-        self.resampler_out_input.clear();
-        for _ in 0..channels {
-            self.resampler_out_output.push(vec![0.0; self.chunk_size]);
-            self.resampler_out_input.push(vec![0.0; internal_chunk_length]);
-        }
-        self.delay_line.resize(channels.try_into().unwrap(), [0.0; LENGTH_IN_SAMPLES]);
-
-        self.resampler_in.set_io_ratio(1.0 / (DEFAULT_TAPE_SPEED as f64), 0).unwrap();
-        self.resampler_out.set_io_ratio(DEFAULT_TAPE_SPEED as f64, 0).unwrap();
+        self.resampler = libsoxr::Soxr::create(MAX_SPEED_FACTOR as f64, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
+        // process(...) needs to process samples in place so we need some space which should never exceed block size:
+        self.delay_line.resize((self.sample_rate * LENGTH_IN_SECONDS) as usize + MAX_BLOCK_SIZE, 0.0);
+        self.delay_line_write_pos = (self.sample_rate * LENGTH_IN_SECONDS) as usize;
+        self.changes.resize(self.delay_line.len() / MIN_BLOCK_SIZE, SpeedChange::default());
+        self.resampler.set_io_ratio(1.0, 0).unwrap();
         true
     }
 
@@ -164,54 +167,85 @@ impl Plugin for VariSpeedDelay {
         _aux: &mut AuxiliaryBuffers,
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
+        let mut change_ratio = false;
         if self.params.tape_speed.smoothed.is_smoothing() {
-            let tape_speed: f64 = self.params.tape_speed.smoothed.next().into();
-            self.resampler_in.set_io_ratio(1.0 / tape_speed, (buffer.len() as f64 * tape_speed) as usize).unwrap();
-            self.resampler_out.set_io_ratio(tape_speed, buffer.len()).unwrap();
+            self.current_speed = speed_to_uint(self.params.tape_speed.smoothed.next());
+            self.changes[self.changes_write_pos] = SpeedChange {
+                timestamp: self.current_timestamp + speed_to_uint(LENGTH_IN_SECONDS * self.sample_rate),
+                speed: self.current_speed
+            };
+            println!("added speed change @ {} (now+{}) : current speed = {}", self.changes[self.changes_write_pos].timestamp, self.changes[self.changes_write_pos].timestamp-self.current_timestamp, self.changes[self.changes_write_pos].speed);
+            self.changes_write_pos += 1;
+            self.changes_write_pos %= self.changes.len();
+            if self.changes_read_pos == self.changes_write_pos {
+                panic!("changes buffer overflow!");
+            }
+            change_ratio = true;
         }
-        assert_eq!(buffer.len() % self.chunk_size, 0);
-        for (_, block) in buffer.iter_blocks(self.chunk_size) {
-            let mut channels: Vec<&mut[f32]> = Vec::new(); // FIXME not real-time-safe
-            for ch in block.into_iter() {
-                channels.push(ch);
+        // TODO: we're checking and setting ratio for the whole output block
+        // this will be inaccurate in case of fast tape speed changes saved in changes queue
+        if self.changes_write_pos != self.changes_read_pos {
+            let change = &self.changes[self.changes_read_pos];
+            let tsdiff: i32 = (self.current_timestamp - change.timestamp) as i32;
+            if tsdiff >= 0 {
+                self.recorded_speed = change.speed;
+                println!("read speed change @ {} : recorded speed {}; current speed {}", change.timestamp, change.speed, self.current_speed);
+                change_ratio = true;
+                self.changes_read_pos += 1;
+                self.changes_read_pos %= self.changes.len();
             }
-            let (done_in, internal_len) = self.resampler_in.process(Some(&channels[0]), &mut self.resampler_in_output[0]).unwrap();
-            if done_in!=self.chunk_size {
-                println!("resampler_in didn't consume all samples, done {}, chunk size {}", done_in, self.chunk_size);
-            }
-            for ch in &mut self.resampler_out_input { // FIXME not real-time-safe
-                ch.resize(internal_len, 0.0);
-            }
-            // TODO suboptimal, excessive copying? try to use slices as Soxr inputs
-            for (delaybuff, res_out_in) in zip(&self.delay_line, &mut self.resampler_out_input) {
-                for i in 0..internal_len {
-                    let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
-                    res_out_in[i] = delaybuff[dlpos];
-                }
-            }
-            for (delaybuff, res_in_out) in zip(&mut self.delay_line, &self.resampler_in_output) {
-                for i in 0..internal_len {
-                    let dlpos = (self.delay_line_pos + i) % LENGTH_IN_SAMPLES;
-                    delaybuff[dlpos] = res_in_out[i];
-                }
-            }
-            self.delay_line_pos += internal_len;
-            self.delay_line_pos %= LENGTH_IN_SAMPLES;
-            let (done_internal, done_out) = self.resampler_out.process(Some(&self.resampler_out_input[0]), &mut self.resampler_out_output[0]).unwrap();
-            if done_out!=self.chunk_size {
-                println!("resampler_out didn't produce enough samples, done {}, chunk size {}", done_out, self.chunk_size);
-            }
-            if done_internal!=internal_len {
-                println!("produced and consumed different number of samples! {} != {}", internal_len, done_internal);
-            }
-    
-            for (out_samples, res_out) in zip(&mut channels, &self.resampler_out_output) {
-                assert_eq!(self.chunk_size, res_out.len()); // XXX
-                for i in 0..self.chunk_size {
-                    out_samples[i] = res_out[i];
-                }
-            }
+        }
+        if change_ratio {
+            self.resampler.set_io_ratio((self.current_speed as f64) / (self.recorded_speed as f64), buffer.len()).unwrap();
+        }
 
+        let iosamples: &mut [f32] = buffer.as_slice()[0];
+
+        if iosamples.len() > MAX_BLOCK_SIZE || iosamples.len() < MIN_BLOCK_SIZE {
+            panic!("block size invalid: {}, should be between {} and {}", buffer.len(), MIN_BLOCK_SIZE, MAX_BLOCK_SIZE);
+        }
+
+        self.current_timestamp += self.current_speed * iosamples.len() as u32;
+
+        let end_index = self.delay_line_write_pos + iosamples.len();
+        if end_index <= self.delay_line.len() {
+            self.delay_line[self.delay_line_write_pos..end_index].clone_from_slice(&iosamples);
+            self.delay_line_write_pos = end_index % self.delay_line.len();
+        } else {
+            let boundary = self.delay_line.len() - self.delay_line_write_pos;
+            self.delay_line[self.delay_line_write_pos..].clone_from_slice(&iosamples[..boundary]);
+            self.delay_line_write_pos = end_index - self.delay_line.len();
+            self.delay_line[..self.delay_line_write_pos].clone_from_slice(&iosamples[boundary..]);
+        }
+
+        if self.delay_line_read_pos < self.delay_line_write_pos {
+            // contiguous buffer
+            let in0 = &self.delay_line[self.delay_line_read_pos..self.delay_line_write_pos];
+            let (done_in, done_out) = self.resampler.process(Some(in0), iosamples).unwrap();
+            if done_out != iosamples.len() {
+                println!("resampler didn't produce enough samples, done {}, block size {}", done_out, iosamples.len());
+            }
+            self.delay_line_read_pos += done_in;
+            //self.delay_line_read_pos %= self.delay_line.len();
+            if !(self.delay_line_read_pos < self.delay_line.len()) {
+                println!("read pos {}, delay len {}, write pos {}", self.delay_line_read_pos, self.delay_line.len(), self.delay_line_write_pos);
+            }
+            assert!(self.delay_line_read_pos < self.delay_line.len());
+        } else {
+            let in1 = &self.delay_line[self.delay_line_read_pos..];
+            let (done_in1, done_out1) = self.resampler.process(Some(in1), iosamples).unwrap();
+            if done_out1 != iosamples.len() {
+                // need more data from delay line
+                let in2 = &self.delay_line[..self.delay_line_write_pos];
+                let (done_in2, done_out2) = self.resampler.process(Some(in2), &mut iosamples[done_out1..]).unwrap();
+                if done_out1 + done_out2 != iosamples.len() {
+                    println!("resampler didn't produce enough samples, done {}+{}, block size {}", done_out1, done_out2, iosamples.len());
+                }
+                self.delay_line_read_pos = done_in2;
+            } else {
+                self.delay_line_read_pos += done_in1;
+                self.delay_line_read_pos %= self.delay_line.len();
+            }
         }
 
         ProcessStatus::Normal
