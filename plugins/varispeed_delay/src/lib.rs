@@ -79,7 +79,7 @@ impl Default for VariSpeedDelay {
 
             sample_rate: 1.0,
 
-            // FIXME initializing fake resamplers, stupid.
+            // FIXME initializing fake resampler, stupid.
             resampler: libsoxr::Soxr::create(1.0, 2.0, 1, None, None, None).unwrap(),
             current_speed: speed_to_uint(DEFAULT_TAPE_SPEED),
             recorded_speed: speed_to_uint(DEFAULT_TAPE_SPEED),
@@ -149,7 +149,7 @@ impl Plugin for VariSpeedDelay {
         // libsoxr in Variable Rate mode needs maximum Input/Output ratio when creating the resampler, provide it:
         self.resampler = libsoxr::Soxr::create(MAX_SPEED_FACTOR as f64, 1.0, channels, Some(&io_spec), Some(&quality), None).unwrap();
         // process(...) needs to process samples in place so we need some space which should never exceed block size:
-        self.delay_line.resize((self.sample_rate * LENGTH_IN_SECONDS) as usize + MAX_BLOCK_SIZE, 0.0);
+        self.delay_line.resize((self.sample_rate * LENGTH_IN_SECONDS) as usize + MAX_BLOCK_SIZE*4, 0.0);
         self.delay_line_write_pos = (self.sample_rate * LENGTH_IN_SECONDS) as usize;
         self.changes.resize(self.delay_line.len() / MIN_BLOCK_SIZE, SpeedChange::default());
         self.resampler.set_io_ratio(1.0, 0).unwrap();
@@ -168,8 +168,10 @@ impl Plugin for VariSpeedDelay {
         _context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let mut change_ratio = false;
+        let mut tape_speed = self.params.tape_speed.value();
         if self.params.tape_speed.smoothed.is_smoothing() {
-            self.current_speed = speed_to_uint(self.params.tape_speed.smoothed.next());
+            tape_speed = self.params.tape_speed.smoothed.next();
+            self.current_speed = speed_to_uint(tape_speed);
             self.changes[self.changes_write_pos] = SpeedChange {
                 timestamp: self.current_timestamp + speed_to_uint(LENGTH_IN_SECONDS * self.sample_rate),
                 speed: self.current_speed
@@ -196,7 +198,10 @@ impl Plugin for VariSpeedDelay {
             }
         }
         if change_ratio {
-            self.resampler.set_io_ratio((self.current_speed as f64) / (self.recorded_speed as f64), buffer.len()).unwrap();
+            let ratio = (self.current_speed as f64) / (self.recorded_speed as f64);
+            self.resampler.set_io_ratio(ratio, buffer.len()).unwrap();
+
+            println!("new ratio: {}; buffered in delay line = {}s pos: write {} read {}, deduced from speed = {}s", ratio, ((self.delay_line_write_pos-self.delay_line_read_pos+self.delay_line.len())%self.delay_line.len()) as f32/self.sample_rate, self.delay_line_write_pos, self.delay_line_read_pos, LENGTH_IN_SECONDS/tape_speed);
         }
 
         let iosamples: &mut [f32] = buffer.as_slice()[0];
@@ -206,6 +211,8 @@ impl Plugin for VariSpeedDelay {
         }
 
         self.current_timestamp += self.current_speed * iosamples.len() as u32;
+
+        //if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ before writing"); }
 
         let end_index = self.delay_line_write_pos + iosamples.len();
         if end_index <= self.delay_line.len() {
@@ -218,7 +225,9 @@ impl Plugin for VariSpeedDelay {
             self.delay_line[..self.delay_line_write_pos].clone_from_slice(&iosamples[boundary..]);
         }
 
-        if self.delay_line_read_pos < self.delay_line_write_pos {
+        //if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after writing"); }
+
+        if self.delay_line_read_pos <= self.delay_line_write_pos {
             // contiguous buffer
             let in0 = &self.delay_line[self.delay_line_read_pos..self.delay_line_write_pos];
             let (done_in, done_out) = self.resampler.process(Some(in0), iosamples).unwrap();
@@ -231,6 +240,9 @@ impl Plugin for VariSpeedDelay {
                 println!("read pos {}, delay len {}, write pos {}", self.delay_line_read_pos, self.delay_line.len(), self.delay_line_write_pos);
             }
             assert!(self.delay_line_read_pos < self.delay_line.len());
+            if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after reading 1, in {}/{}, out {}/{}", done_in, in0.len(), done_out, iosamples.len()); } else {
+                println!("in {}/{}, out {}/{}", done_in, in0.len(), done_out, iosamples.len());
+            }
         } else {
             let in1 = &self.delay_line[self.delay_line_read_pos..];
             let (done_in1, done_out1) = self.resampler.process(Some(in1), iosamples).unwrap();
@@ -242,11 +254,15 @@ impl Plugin for VariSpeedDelay {
                     println!("resampler didn't produce enough samples, done {}+{}, block size {}", done_out1, done_out2, iosamples.len());
                 }
                 self.delay_line_read_pos = done_in2;
+                if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after reading 2"); }
             } else {
                 self.delay_line_read_pos += done_in1;
                 self.delay_line_read_pos %= self.delay_line.len();
+                if self.delay_line_write_pos==self.delay_line_read_pos { println!("delay line empty/overflow @ after reading 3"); }
             }
         }
+
+        
 
         ProcessStatus::Normal
     }
